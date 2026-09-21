@@ -5,7 +5,6 @@
 /// with a complete keycode table.  rdev's macOS support is incomplete for both.
 ///
 /// On other platforms we fall back to `rdev::listen` and `rdev::simulate`.
-
 use rdev::{Button, Event, EventType, Key};
 use std::time::SystemTime;
 
@@ -13,323 +12,336 @@ use std::time::SystemTime;
 
 #[cfg(target_os = "macos")]
 mod macos {
-    #![allow(improper_ctypes_definitions)]
-    #![allow(improper_ctypes)]
-    #![allow(static_mut_refs)]
-
     use super::*;
-    use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, EventField};
+    use core_graphics::event::{CGEvent, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use std::os::raw::c_void;
 
-    // ── Event tap (listening) ─────────────────────────────────────────────
-
-    type CFMachPortRef = *const c_void;
-    type CFIndex = u64;
-    type CFRunLoopSourceRef = *const c_void;
-    type CFRunLoopRef = *const c_void;
-    type CGEventTapProxy = *const c_void;
-    type CGEventRef = CGEvent;
-
-    const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
-
-    #[repr(u32)]
-    #[allow(dead_code)]
-    enum CGEventTapOption {
-        Default = 0,
-        ListenOnly = 1,
-    }
-
-    type QCallback = unsafe extern "C" fn(
-        proxy: CGEventTapProxy,
-        _type: CGEventType,
-        cg_event: CGEventRef,
-        user_info: *mut c_void,
-    ) -> CGEventRef;
-
-    #[link(name = "Cocoa", kind = "framework")]
+    type Ref = *const c_void;
+    type Callback = unsafe extern "C" fn(Ref, u32, Ref, *mut c_void) -> Ref;
+    #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn CGEventTapCreate(
-            tap: CGEventTapLocation,
+            tap: u32,
             place: u32,
-            options: CGEventTapOption,
-            events_of_interest: u64,
-            callback: QCallback,
-            user_info: *mut c_void,
-        ) -> CFMachPortRef;
-
-        fn CFMachPortCreateRunLoopSource(
-            allocator: *const c_void,
-            tap: CFMachPortRef,
-            order: CFIndex,
-        ) -> CFRunLoopSourceRef;
-
-        fn CFRunLoopAddSource(
-            rl: CFRunLoopRef,
-            source: CFRunLoopSourceRef,
-            mode: *const c_void,
-        );
-
-        fn CFRunLoopGetCurrent() -> CFRunLoopRef;
-        fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+            options: u32,
+            mask: u64,
+            callback: Callback,
+            info: *mut c_void,
+        ) -> Ref;
+        fn CGEventTapEnable(tap: Ref, enable: bool);
+        fn CGPreflightPostEventAccess() -> bool;
+        fn CGPreflightListenEventAccess() -> bool;
+        fn CGRequestPostEventAccess() -> bool;
+        fn CGRequestListenEventAccess() -> bool;
+        fn CGEventGetIntegerValueField(event: Ref, field: u32) -> i64;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFMachPortCreateRunLoopSource(allocator: Ref, tap: Ref, order: isize) -> Ref;
+        fn CFRunLoopAddSource(rl: Ref, source: Ref, mode: Ref);
+        fn CFRunLoopRemoveSource(rl: Ref, source: Ref, mode: Ref);
+        fn CFRunLoopGetCurrent() -> Ref;
         fn CFRunLoopRun();
-
-        static kCFRunLoopCommonModes: *const c_void;
+        fn CFRelease(value: Ref);
+        static kCFRunLoopCommonModes: Ref;
     }
-
-    static mut GLOBAL_CALLBACK: Option<Box<dyn FnMut(Event)>> = None;
-
-    unsafe extern "C" fn raw_callback(
-        _proxy: CGEventTapProxy,
-        _type: CGEventType,
-        cg_event: CGEventRef,
-        _user_info: *mut c_void,
-    ) -> CGEventRef {
-        if let Some(event) = convert_event(_type, &cg_event) {
-            if let Some(cb) = &mut GLOBAL_CALLBACK {
-                cb(event);
+    struct Context {
+        callback: Box<dyn FnMut(Event)>,
+        tap: Ref,
+    }
+    unsafe extern "C" fn raw_callback(_: Ref, kind: u32, event: Ref, info: *mut c_void) -> Ref {
+        // CGEventTap passes a borrowed event; never wrap it as an owned CGEvent.
+        let context = &mut *(info as *mut Context);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if kind == u32::MAX || kind == u32::MAX - 1 {
+                // A disabled tap may have missed mouse-up events. Cancel every binding.
+                for id in 0..=255 {
+                    (context.callback)(Event {
+                        event_type: EventType::ButtonRelease(button(id)),
+                        time: SystemTime::now(),
+                        name: None,
+                    });
+                }
+                CGEventTapEnable(context.tap, true);
+                return;
             }
+            let (button, down) = match kind {
+                1 => (Button::Left, true),
+                2 => (Button::Left, false),
+                3 => (Button::Right, true),
+                4 => (Button::Right, false),
+                25 | 26 if !event.is_null() => {
+                    let id = CGEventGetIntegerValueField(event, 3);
+                    if !(0..=255).contains(&id) {
+                        return;
+                    }
+                    (button(id as u8), kind == 25)
+                }
+                _ => return,
+            };
+            (context.callback)(Event {
+                event_type: if down {
+                    EventType::ButtonPress(button)
+                } else {
+                    EventType::ButtonRelease(button)
+                },
+                time: SystemTime::now(),
+                name: None,
+            });
+        }));
+        if result.is_err() {
+            crate::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        cg_event
+        event
     }
-
-    fn convert_event(_type: CGEventType, cg_event: &CGEvent) -> Option<Event> {
-        let event_type = match _type {
-            CGEventType::LeftMouseDown => EventType::ButtonPress(Button::Left),
-            CGEventType::LeftMouseUp => EventType::ButtonRelease(Button::Left),
-            CGEventType::RightMouseDown => EventType::ButtonPress(Button::Right),
-            CGEventType::RightMouseUp => EventType::ButtonRelease(Button::Right),
-            CGEventType::OtherMouseDown => {
-                let btn = cg_event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-                EventType::ButtonPress(button_from_i64(btn))
-            }
-            CGEventType::OtherMouseUp => {
-                let btn = cg_event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-                EventType::ButtonRelease(button_from_i64(btn))
-            }
-            _ => return None,
-        };
-
-        Some(Event { event_type, time: SystemTime::now(), name: None })
-    }
-
-    fn button_from_i64(n: i64) -> Button {
-        match n {
+    fn button(id: u8) -> Button {
+        match id {
             0 => Button::Left,
             1 => Button::Right,
             2 => Button::Middle,
-            _ => Button::Unknown(n as u8),
+            n => Button::Unknown(n),
         }
     }
-
-    fn mouse_event_mask() -> u64 {
-        let m = |t: CGEventType| -> u64 { 1 << (t as u64) };
-        m(CGEventType::LeftMouseDown)
-            | m(CGEventType::LeftMouseUp)
-            | m(CGEventType::RightMouseDown)
-            | m(CGEventType::RightMouseUp)
-            | m(CGEventType::OtherMouseDown)
-            | m(CGEventType::OtherMouseUp)
-            | m(CGEventType::MouseMoved)
-            | m(CGEventType::LeftMouseDragged)
-            | m(CGEventType::RightMouseDragged)
-            | m(CGEventType::ScrollWheel)
-    }
-
-    pub fn listen<T>(callback: T) -> Result<(), String>
-    where
-        T: FnMut(Event) + 'static,
-    {
+    pub fn permissions(request: Option<&str>) -> super::Permissions {
         unsafe {
-            GLOBAL_CALLBACK = Some(Box::new(callback));
-
+            match request {
+                Some("keyboard") if !CGPreflightPostEventAccess() => {
+                    CGRequestPostEventAccess();
+                }
+                Some("input") if !CGPreflightListenEventAccess() => {
+                    CGRequestListenEventAccess();
+                }
+                _ => {}
+            }
+            super::Permissions {
+                keyboard: CGPreflightPostEventAccess(),
+                input_monitoring: CGPreflightListenEventAccess(),
+            }
+        }
+    }
+    pub fn check_playback_permission() -> Result<(), String> {
+        if unsafe { CGPreflightPostEventAccess() } {
+            Ok(())
+        } else {
+            Err("Accessibility permission is required to post keyboard events. Enable it for Mouse Macro (or your terminal), then restart.".into())
+        }
+    }
+    pub fn listen<T: FnMut(Event) + 'static>(callback: T) -> Result<(), String> {
+        let mut context = Box::new(Context {
+            callback: Box::new(callback),
+            tap: std::ptr::null(),
+        });
+        unsafe {
+            let mask = [1, 2, 3, 4, 25, 26]
+                .iter()
+                .fold(0u64, |mask, n| mask | (1 << n));
             let tap = CGEventTapCreate(
-                CGEventTapLocation::HID,
-                K_CG_HEAD_INSERT_EVENT_TAP,
-                CGEventTapOption::ListenOnly,
-                mouse_event_mask(),
+                0,
+                0,
+                1,
+                mask,
                 raw_callback,
-                std::ptr::null_mut(),
+                (&mut *context as *mut Context).cast(),
             );
-
             if tap.is_null() {
-                return Err(
-                    "Failed to create event tap.\n\
-                     Make sure Accessibility permission is granted:\n\
-                     System Settings → Privacy & Security → Accessibility"
-                        .to_string(),
-                );
+                return Err("Cannot listen to mouse events. Enable Accessibility and Input Monitoring for Mouse Macro (or your terminal) in System Settings → Privacy & Security, then restart.".into());
             }
-
-            let loop_source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
-            if loop_source.is_null() {
-                return Err("Failed to create run loop source.".to_string());
+            context.tap = tap;
+            let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+            if source.is_null() {
+                CFRelease(tap);
+                return Err("Cannot create event run loop source".into());
             }
-
-            let current_loop = CFRunLoopGetCurrent();
-            CFRunLoopAddSource(current_loop, loop_source, kCFRunLoopCommonModes);
+            let run_loop = CFRunLoopGetCurrent();
+            CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
             CGEventTapEnable(tap, true);
             CFRunLoopRun();
+            CGEventTapEnable(tap, false);
+            CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
+            CFRelease(source);
+            CFRelease(tap);
         }
         Ok(())
     }
 
-    // ── Keyboard simulation ───────────────────────────────────────────────
-    //
-    // rdev's `code_from_key` is missing many keys on macOS (Kp*, Delete,
-    // Home, End, PageUp/Down, Insert, PrintScreen, ScrollLock, Pause,
-    // NumLock).  We provide a complete mapping here.
-
-    /// Convert a Key to a macOS virtual keycode.
-    /// Returns None only for keys that genuinely have no macOS equivalent.
+    const KEYCODES: &[(Key, u16)] = &[
+        (Key::KeyA, 0),
+        (Key::KeyB, 11),
+        (Key::KeyC, 8),
+        (Key::KeyD, 2),
+        (Key::KeyE, 14),
+        (Key::KeyF, 3),
+        (Key::KeyG, 5),
+        (Key::KeyH, 4),
+        (Key::KeyI, 34),
+        (Key::KeyJ, 38),
+        (Key::KeyK, 40),
+        (Key::KeyL, 37),
+        (Key::KeyM, 46),
+        (Key::KeyN, 45),
+        (Key::KeyO, 31),
+        (Key::KeyP, 35),
+        (Key::KeyQ, 12),
+        (Key::KeyR, 15),
+        (Key::KeyS, 1),
+        (Key::KeyT, 17),
+        (Key::KeyU, 32),
+        (Key::KeyV, 9),
+        (Key::KeyW, 13),
+        (Key::KeyX, 7),
+        (Key::KeyY, 16),
+        (Key::KeyZ, 6),
+        (Key::Num0, 29),
+        (Key::Num1, 18),
+        (Key::Num2, 19),
+        (Key::Num3, 20),
+        (Key::Num4, 21),
+        (Key::Num5, 23),
+        (Key::Num6, 22),
+        (Key::Num7, 26),
+        (Key::Num8, 28),
+        (Key::Num9, 25),
+        (Key::Minus, 27),
+        (Key::Equal, 24),
+        (Key::LeftBracket, 33),
+        (Key::RightBracket, 30),
+        (Key::SemiColon, 41),
+        (Key::Quote, 39),
+        (Key::Comma, 43),
+        (Key::Dot, 47),
+        (Key::Slash, 44),
+        (Key::BackSlash, 42),
+        (Key::BackQuote, 50),
+        (Key::IntlBackslash, 10),
+        (Key::Alt, 58),
+        (Key::AltGr, 61),
+        (Key::ControlLeft, 59),
+        (Key::ControlRight, 62),
+        (Key::ShiftLeft, 56),
+        (Key::ShiftRight, 60),
+        (Key::MetaLeft, 55),
+        (Key::MetaRight, 54),
+        (Key::CapsLock, 57),
+        (Key::Function, 63),
+        (Key::Return, 36),
+        (Key::Tab, 48),
+        (Key::Space, 49),
+        (Key::Backspace, 51),
+        (Key::Escape, 53),
+        (Key::Delete, 117),
+        (Key::UpArrow, 126),
+        (Key::DownArrow, 125),
+        (Key::LeftArrow, 123),
+        (Key::RightArrow, 124),
+        (Key::Home, 115),
+        (Key::End, 119),
+        (Key::PageUp, 116),
+        (Key::PageDown, 121),
+        (Key::F1, 122),
+        (Key::F2, 120),
+        (Key::F3, 99),
+        (Key::F4, 118),
+        (Key::F5, 96),
+        (Key::F6, 97),
+        (Key::F7, 98),
+        (Key::F8, 100),
+        (Key::F9, 101),
+        (Key::F10, 109),
+        (Key::F11, 103),
+        (Key::F12, 111),
+        (Key::Kp0, 82),
+        (Key::Kp1, 83),
+        (Key::Kp2, 84),
+        (Key::Kp3, 85),
+        (Key::Kp4, 86),
+        (Key::Kp5, 87),
+        (Key::Kp6, 88),
+        (Key::Kp7, 89),
+        (Key::Kp8, 91),
+        (Key::Kp9, 92),
+        (Key::KpReturn, 76),
+        (Key::KpMinus, 78),
+        (Key::KpPlus, 69),
+        (Key::KpMultiply, 67),
+        (Key::KpDivide, 75),
+        (Key::KpDelete, 65),
+        (Key::Insert, 114),
+        (Key::NumLock, 71),
+        (Key::PrintScreen, 105),
+        (Key::ScrollLock, 107),
+        (Key::Pause, 113),
+    ];
     fn keycode_from_key(key: Key) -> Option<u16> {
-        // Letters (QWERTY layout keycodes)
-        const KEY_A: u16 = 0;    const KEY_B: u16 = 11;   const KEY_C: u16 = 8;
-        const KEY_D: u16 = 2;    const KEY_E: u16 = 14;   const KEY_F: u16 = 3;
-        const KEY_G: u16 = 5;    const KEY_H: u16 = 4;    const KEY_I: u16 = 34;
-        const KEY_J: u16 = 38;   const KEY_K: u16 = 40;   const KEY_L: u16 = 37;
-        const KEY_M: u16 = 46;   const KEY_N: u16 = 45;   const KEY_O: u16 = 31;
-        const KEY_P: u16 = 35;   const KEY_Q: u16 = 12;   const KEY_R: u16 = 15;
-        const KEY_S: u16 = 1;    const KEY_T: u16 = 17;   const KEY_U: u16 = 32;
-        const KEY_V: u16 = 9;    const KEY_W: u16 = 13;   const KEY_X: u16 = 7;
-        const KEY_Y: u16 = 16;   const KEY_Z: u16 = 6;
-
-        // Number row
-        const NUM0: u16 = 29; const NUM1: u16 = 18; const NUM2: u16 = 19;
-        const NUM3: u16 = 20; const NUM4: u16 = 21; const NUM5: u16 = 23;
-        const NUM6: u16 = 22; const NUM7: u16 = 26; const NUM8: u16 = 28;
-        const NUM9: u16 = 25;
-
-        // Symbols (US layout)
-        const MINUS: u16 = 27;      const EQUAL: u16 = 24;
-        const LEFT_BRACKET: u16 = 33;  const RIGHT_BRACKET: u16 = 30;
-        const SEMI_COLON: u16 = 41; const QUOTE: u16 = 39;
-        const COMMA: u16 = 43;      const DOT: u16 = 47;
-        const SLASH: u16 = 44;      const BACK_SLASH: u16 = 42;
-        const BACK_QUOTE: u16 = 50;
-
-        // Modifiers
-        const ALT: u16 = 58;           const ALT_GR: u16 = 61;
-        const CONTROL_LEFT: u16 = 59;  const CONTROL_RIGHT: u16 = 62;
-        const SHIFT_LEFT: u16 = 56;    const SHIFT_RIGHT: u16 = 60;
-        const META_LEFT: u16 = 55;     const META_RIGHT: u16 = 54;
-        const CAPS_LOCK: u16 = 57;     const FUNCTION: u16 = 63;
-
-        // Whitespace / editing
-        const RETURN: u16 = 36;     const TAB: u16 = 48;
-        const SPACE: u16 = 49;      const BACKSPACE: u16 = 51;
-        const ESCAPE: u16 = 53;     const DELETE_FWD: u16 = 117;
-
-        // Arrows
-        const UP: u16 = 126;    const DOWN: u16 = 125;
-        const LEFT: u16 = 123;  const RIGHT: u16 = 124;
-
-        // Navigation
-        const HOME: u16 = 115;      const END: u16 = 119;
-        const PAGE_UP: u16 = 116;   const PAGE_DOWN: u16 = 121;
-
-        // Function keys
-        const F1: u16 = 122;  const F2: u16 = 120;  const F3: u16 = 99;
-        const F4: u16 = 118;  const F5: u16 = 96;   const F6: u16 = 97;
-        const F7: u16 = 98;   const F8: u16 = 100;  const F9: u16 = 101;
-        const F10: u16 = 109; const F11: u16 = 103; const F12: u16 = 111;
-        const F13: u16 = 105; const F14: u16 = 107; const F15: u16 = 113;
-
-        // Numpad
-        const KP0: u16 = 82; const KP1: u16 = 83; const KP2: u16 = 84;
-        const KP3: u16 = 85; const KP4: u16 = 86; const KP5: u16 = 87;
-        const KP6: u16 = 88; const KP7: u16 = 89; const KP8: u16 = 91;
-        const KP9: u16 = 92;
-        const KP_RETURN: u16 = 76;  const KP_MINUS: u16 = 78;
-        const KP_PLUS: u16 = 69;    const KP_MULTIPLY: u16 = 67;
-        const KP_DIVIDE: u16 = 75;  const KP_DELETE: u16 = 65;
-
-        // Misc
-        const INSERT: u16 = 114;    const NUM_LOCK: u16 = 71;
-        const INTL_BACKSLASH: u16 = 10;
-
-        // ── Match ──────────────────────────────────────────────────────
-
-        let code = match key {
-            Key::KeyA => KEY_A, Key::KeyB => KEY_B, Key::KeyC => KEY_C,
-            Key::KeyD => KEY_D, Key::KeyE => KEY_E, Key::KeyF => KEY_F,
-            Key::KeyG => KEY_G, Key::KeyH => KEY_H, Key::KeyI => KEY_I,
-            Key::KeyJ => KEY_J, Key::KeyK => KEY_K, Key::KeyL => KEY_L,
-            Key::KeyM => KEY_M, Key::KeyN => KEY_N, Key::KeyO => KEY_O,
-            Key::KeyP => KEY_P, Key::KeyQ => KEY_Q, Key::KeyR => KEY_R,
-            Key::KeyS => KEY_S, Key::KeyT => KEY_T, Key::KeyU => KEY_U,
-            Key::KeyV => KEY_V, Key::KeyW => KEY_W, Key::KeyX => KEY_X,
-            Key::KeyY => KEY_Y, Key::KeyZ => KEY_Z,
-
-            Key::Num0 => NUM0, Key::Num1 => NUM1, Key::Num2 => NUM2,
-            Key::Num3 => NUM3, Key::Num4 => NUM4, Key::Num5 => NUM5,
-            Key::Num6 => NUM6, Key::Num7 => NUM7, Key::Num8 => NUM8,
-            Key::Num9 => NUM9,
-
-            Key::Minus => MINUS, Key::Equal => EQUAL,
-            Key::LeftBracket => LEFT_BRACKET, Key::RightBracket => RIGHT_BRACKET,
-            Key::SemiColon => SEMI_COLON, Key::Quote => QUOTE,
-            Key::Comma => COMMA, Key::Dot => DOT,
-            Key::Slash => SLASH, Key::BackSlash => BACK_SLASH,
-            Key::BackQuote => BACK_QUOTE, Key::IntlBackslash => INTL_BACKSLASH,
-
-            Key::Alt => ALT, Key::AltGr => ALT_GR,
-            Key::ControlLeft => CONTROL_LEFT, Key::ControlRight => CONTROL_RIGHT,
-            Key::ShiftLeft => SHIFT_LEFT, Key::ShiftRight => SHIFT_RIGHT,
-            Key::MetaLeft => META_LEFT, Key::MetaRight => META_RIGHT,
-            Key::CapsLock => CAPS_LOCK, Key::Function => FUNCTION,
-
-            Key::Return => RETURN, Key::Tab => TAB,
-            Key::Space => SPACE, Key::Backspace => BACKSPACE,
-            Key::Escape => ESCAPE, Key::Delete => DELETE_FWD,
-
-            Key::UpArrow => UP, Key::DownArrow => DOWN,
-            Key::LeftArrow => LEFT, Key::RightArrow => RIGHT,
-
-            Key::Home => HOME, Key::End => END,
-            Key::PageUp => PAGE_UP, Key::PageDown => PAGE_DOWN,
-
-            Key::F1 => F1, Key::F2 => F2, Key::F3 => F3, Key::F4 => F4,
-            Key::F5 => F5, Key::F6 => F6, Key::F7 => F7, Key::F8 => F8,
-            Key::F9 => F9, Key::F10 => F10, Key::F11 => F11, Key::F12 => F12,
-
-            Key::Kp0 => KP0, Key::Kp1 => KP1, Key::Kp2 => KP2,
-            Key::Kp3 => KP3, Key::Kp4 => KP4, Key::Kp5 => KP5,
-            Key::Kp6 => KP6, Key::Kp7 => KP7, Key::Kp8 => KP8,
-            Key::Kp9 => KP9,
-            Key::KpReturn => KP_RETURN, Key::KpMinus => KP_MINUS,
-            Key::KpPlus => KP_PLUS, Key::KpMultiply => KP_MULTIPLY,
-            Key::KpDivide => KP_DIVIDE, Key::KpDelete => KP_DELETE,
-
-            Key::Insert => INSERT, Key::NumLock => NUM_LOCK,
-            Key::PrintScreen => F13,   // F13 = Print Screen on Mac
-            Key::ScrollLock => F14,    // F14 = Scroll Lock on Mac
-            Key::Pause => F15,         // F15 = Pause on Mac
-
-            Key::Unknown(raw) => {
-                if raw <= u16::MAX as u32 {
-                    raw as u16
-                } else {
-                    return None;
-                }
-            }
-        };
-
-        Some(code)
+        if let Key::Unknown(raw) = key {
+            return u16::try_from(raw).ok();
+        }
+        KEYCODES
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, code)| *code)
     }
-
+    pub fn key_from_code(code: u16) -> Key {
+        KEYCODES
+            .iter()
+            .find(|(_, c)| *c == code)
+            .map_or(Key::Unknown(code as u32), |(key, _)| *key)
+    }
+    thread_local! { static MODIFIERS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    fn modifier_flags(codes: &[u16]) -> core_graphics::event::CGEventFlags {
+        use core_graphics::event::CGEventFlags as F;
+        codes.iter().fold(F::empty(), |flags, code| {
+            flags
+                | match code {
+                    54 | 55 => F::CGEventFlagCommand,
+                    56 | 60 => F::CGEventFlagShift,
+                    58 | 61 => F::CGEventFlagAlternate,
+                    59 | 62 => F::CGEventFlagControl,
+                    63 => F::CGEventFlagSecondaryFn,
+                    _ => F::empty(),
+                }
+        })
+    }
     pub fn simulate_key(key: Key, press: bool) -> Result<(), String> {
-        let code = keycode_from_key(key)
-            .ok_or_else(|| format!("No macOS keycode for key {:?}", key))?;
+        let code =
+            keycode_from_key(key).ok_or_else(|| format!("No macOS keycode for key {:?}", key))?;
 
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .map_err(|_| "Failed to create CGEventSource — check Accessibility permissions".to_string())?;
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
+            "Failed to create CGEventSource — check Accessibility permissions".to_string()
+        })?;
 
         let cg_event = CGEvent::new_keyboard_event(source, code, press)
             .map_err(|_| format!("Failed to create keyboard event for key {:?}", key))?;
 
+        MODIFIERS.with(|state| {
+            let mut codes = state.borrow_mut();
+            let old = modifier_flags(&codes);
+            if matches!(code, 54..=56 | 58..=63) {
+                codes.retain(|c| *c != code);
+                if press {
+                    codes.push(code);
+                }
+            }
+            cg_event.set_flags((cg_event.get_flags() & !old) | modifier_flags(&codes));
+        });
         cg_event.post(CGEventTapLocation::HID);
         Ok(())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn keycode_roundtrip() {
+            for (key, code) in KEYCODES {
+                assert_eq!(key_from_code(*code), *key);
+                assert_eq!(keycode_from_key(*key), Some(*code));
+            }
+        }
+        #[test]
+        fn right_modifier_remains_held() {
+            assert_eq!(modifier_flags(&[56, 60]), modifier_flags(&[60]));
+            assert_ne!(modifier_flags(&[60]), modifier_flags(&[]));
+        }
     }
 }
 
@@ -364,4 +376,41 @@ pub fn simulate_key(key: Key, press: bool) -> Result<(), String> {
         EventType::KeyRelease(key)
     };
     rdev::simulate(&event_type).map_err(|e| format!("{:?}", e))
+}
+
+#[cfg(target_os = "macos")]
+pub fn key_from_code(code: u16) -> Key {
+    macos::key_from_code(code)
+}
+
+pub fn check_playback_permission() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::check_playback_permission()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct Permissions {
+    pub keyboard: bool,
+    pub input_monitoring: bool,
+}
+
+pub fn permissions(request: Option<&str>) -> Permissions {
+    #[cfg(target_os = "macos")]
+    {
+        macos::permissions(request)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = request;
+        Permissions {
+            keyboard: true,
+            input_monitoring: true,
+        }
+    }
 }
