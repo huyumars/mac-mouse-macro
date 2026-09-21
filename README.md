@@ -1,5 +1,7 @@
 # Mouse Macro
 
+<img src="macos/Assets/AppIcon.png" alt="Mouse Macro 应用图标" width="96">
+
 按住鼠标按钮，循环播放键盘宏；松开立即取消并释放宏按键。支持多个鼠标绑定、侧键、独立时间设置，以及 macOS 原生配置和录制窗口。
 
 ## 界面预览
